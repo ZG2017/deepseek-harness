@@ -54,6 +54,16 @@ import type {
   SessionRequestId,
 } from './types.ts'
 
+declare module '@deepseek-ai/cordis' {
+  interface Context {
+    /**
+     * ALICE (local, not upstream): optional resolver naming an image-capable
+     * route to switch to when an image prompt reaches a text-only model.
+     */
+    imageCapableFallbackRoute?: () => Promise<{ readonly provider: string; readonly model: string } | undefined>
+  }
+}
+
 interface SessionReadState {
   readonly id: SessionId
   readonly header: SessionHeader
@@ -339,7 +349,8 @@ export class SessionCommandController {
         if (hasImage) {
           const current = this.agents.selectionFor(agent).current
           const model = await this.ctx.llm.resolveModelInfo(current.provider, current.model)
-          if (model.inputModalities !== undefined && !model.inputModalities.includes('image')) {
+          if (model.inputModalities !== undefined && !model.inputModalities.includes('image')
+            && !await this.switchToImageCapableFallback(agent)) {
             throw new RemoteError(
               'session/attachment-invalid',
               `Model "${current.model}" does not support image input.`,
@@ -374,6 +385,36 @@ export class SessionCommandController {
       return { accepted: true }
     }
     return hasImage ? this.agents.serializeImageAdmission(agent, admit) : admit()
+  }
+
+  /**
+   * ALICE (local, not upstream): switch the Session to the route an optional
+   * `imageCapableFallbackRoute` provider names, instead of rejecting an image
+   * prompt sent to a text-only model. The switch goes through
+   * {@link ApiSessionAgentController.selectForNextRequest}, so it is durable
+   * and the agent's own model-change notice reports it to the model.
+   * @param agent - live Agent receiving the image prompt.
+   * @returns true when the Session now uses an image-capable model.
+   */
+  private async switchToImageCapableFallback(agent: Agent): Promise<boolean> {
+    const resolveFallback = this.ctx.get('imageCapableFallbackRoute')
+    if (resolveFallback === undefined) return false
+    try {
+      const fallback = await resolveFallback()
+      if (fallback === undefined) return false
+      const resolved = await this.ctx.llm.resolveCallConfig({ provider: fallback.provider, model: fallback.model })
+      const info = await this.ctx.llm.resolveModelInfo(resolved.provider, resolved.model)
+      if (info.inputModalities?.includes('image') !== true) return false
+      this.agents.selectForNextRequest(agent, {
+        provider: resolved.provider,
+        model: resolved.model,
+        ...(resolved.reasoningEffort === undefined ? {} : { reasoningEffort: resolved.reasoningEffort }),
+      })
+      return true
+    } catch (error) {
+      this.ctx.logger.warn(`session-controller: imageCapableFallbackRoute failed, rejecting the image prompt: ${String(error)}`)
+      return false
+    }
   }
 
   private async requireModel(selection: Pick<AgentModelSelection, 'provider' | 'model'>): Promise<void> {
